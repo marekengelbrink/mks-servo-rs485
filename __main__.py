@@ -29,7 +29,9 @@ instrument.serial.baudrate = 38400
 test_servo = servo.Servo(instrument, servo.MotorType.SERVO_42_D, 1, 1000, 20, 8)
 # test_servo.motor_calibrate()
 
-while 1:
-    value = test_servo.read_encoder_value()
-    print(f"Encoder value: {value}")
-    time.sleep(0.1)
+test_servo.write_no_limit_go_home_parameter(max_return_angle=720, no_switch_go_home=True, no_limit_current=500)
+
+test_servo.go_home()
+
+
+
