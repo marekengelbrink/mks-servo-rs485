@@ -3,3 +3,4 @@ crc>=7.1.0
 mypy>=1.13.0
 pylint>=3.3.1
 minimalmodbus>=2.1.1
+xknx>=3.3.0

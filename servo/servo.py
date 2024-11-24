@@ -1,9 +1,14 @@
 """ This module provides a class for controlling the servo motor """
+import logging
 import math
+import time
 from dataclasses import dataclass
 from enum import Enum
 import struct
 import minimalmodbus
+
+ENCODER_STEPS = 16384
+ANGLE_TO_AXIS = ENCODER_STEPS/360
 
 class Status(Enum):
     """ Enum for the status of the servo motor """
@@ -96,6 +101,10 @@ class MotorZeroSpeed(Enum):
     FAST = 3
     FASTEST = 4
 
+class MotorSpeedParameterSaveClean(Enum):
+    """ Enum for the speed parameter save clean """
+    SAVE = 0xC8
+    CLEAN = 0xCA
 
 @dataclass
 class Servo:
@@ -104,23 +113,43 @@ class Servo:
     address: int
     max_current: int
     hold_current_percent: int
-    microstep: int
+    full_steps: int
+    micro_steps: int
     motor_type: MotorType
 
     def __init__(self, mb: minimalmodbus.Instrument, motor_type: MotorType, address: int,
-                 max_current: int, hold_current_percent: int, microstep: int):
+                 max_current: int, hold_current_percent: int,full_steps: int, micro_steps: int):
         self.mb = mb
         self.address = address
         self.max_current = min(max_current, max_current_dict.get(motor_type, 0))
         self.hold_current_percent = hold_current_percent
-        self.microstep = microstep
+        self.full_steps = full_steps
+        self.micro_steps = micro_steps
         self.motor_type = motor_type
+
+    def __post_init__(self):
+        self.write_max_current()
+        self.write_hold_current()
+        self.write_subdivision()
 
     def read_encoder_value_carry(self) -> tuple[int, int]:
         """ Read the encoder value """
         encoder_value = self.mb.read_registers(functioncode=4, registeraddress=0x30, number_of_registers=3)
-        value = encoder_value[2]
-        carry = encoder_value[0] << 8 | encoder_value[1]
+        # The carry is in the first register (16 bits)
+        value = encoder_value[2]  # Extract the first register value (assumes unsigned)
+
+        # Combine the next two registers into a single 32-bit signed integer
+        msb = encoder_value[0]
+        lsb = encoder_value[1]
+        carry = (msb << 16) | lsb
+
+        if carry >= 0x80000000:
+            carry -= 0x100000000
+            value = value - ENCODER_STEPS
+
+        if value >= 0x8000:
+            value -= 0x10000
+
         return carry, value
 
     def read_encoder_value(self) -> int:
@@ -201,7 +230,7 @@ class Servo:
 
     def write_work_mode(self, mode: MotorWorkMode) -> None:
         """ Set the motor's work mode """
-        val_mode = int(mode)
+        val_mode = mode.value
         self.mb.write_register(functioncode=6, registeraddress=0x82, value=val_mode)
 
     def write_max_current(self) -> None:
@@ -215,7 +244,7 @@ class Servo:
 
     def write_subdivision(self) -> None:
         """ Set the motor's microstep """
-        self.mb.write_register(functioncode=6, registeraddress=0x84, value=self.microstep)
+        self.mb.write_register(functioncode=6, registeraddress=0x84, value=self.micro_steps)
 
     def write_active_enable(self, enable: MotorActiveEnable) -> None:
         """ Enable or disable the motor """
@@ -270,14 +299,15 @@ class Servo:
         values = [end_stop_level.value, home_dir.value, speed_high, speed_low, int(enable_end_stop_limit)]
         self.mb.write_registers(registeraddress=0x90, values=values)
 
-    def write_no_limit_go_home_parameter(self, max_return_angle: int, no_switch_go_home: bool,
+    def write_no_limit_go_home_parameter(self, max_return_angle: float, no_switch_go_home: bool,
                                          no_limit_current: int) -> None:
         """ Set the no limit go home parameter """
-        angle_high = max_return_angle >> 8
-        angle_low = max_return_angle & 0xFF
-
-        values = [angle_high, angle_low, int(no_switch_go_home), no_limit_current]
+        axis = int(max_return_angle * ANGLE_TO_AXIS)
+        axis_low = axis & 0xFFFF
+        axis_high = (axis >> 16) & 0xFFFF
+        values = [axis_high, axis_low, int(no_switch_go_home), no_limit_current]
         self.mb.write_registers(registeraddress=0x94, values=values)
+        time.sleep(0.5)
 
     def write_end_stop_port_remap(self, enable: bool) -> None:
         """ Enable or disable the end stop port remap """
@@ -302,10 +332,106 @@ class Servo:
     def go_home(self) -> None:
         """ Move the motor to the home position """
         self.mb.write_register(functioncode=6, registeraddress=0x91, value=1)
+        self.wait_until_motor_status(MotorStatus.STOP)
+        time.sleep(1)
+        self.wait_until_motor_status(MotorStatus.STOP)
 
-    def move_to_absolute_angle(self, acc: int, speed: int, angle: int) -> None:
+
+    def emergency_stop(self) -> None:
+        """ Stop the motor """
+        self.mb.write_register(functioncode=6, registeraddress=0xF7, value=1)
+
+    def move_by_speed(self, direction: MotorDirection, acc: int, speed: int) -> None:
+        """ Move the motor at the specified speed """
+        self.check_speed(speed)
+        self.check_acceleration(acc)
+
+        dir_acc = direction.value << 8 | acc
+        values = [dir_acc, speed]
+        self.mb.write_registers(registeraddress=0xF6, values=values)
+
+    def save_speed_parameters(self, save_clean: MotorSpeedParameterSaveClean) -> None:
+        """ Save or clean the speed parameters """
+        self.mb.write_register(functioncode=6, registeraddress=0xFF, value=save_clean.value)
+
+    def move_relative_by_pulses(self, direction: MotorDirection, acc: int, speed: int, pulses: int) -> None:
+        """ Move the motor by the specified number of pulses """
+        self.check_pulses(pulses)
+        self.check_speed(speed)
+        self.check_acceleration(acc)
+        dir_acc = direction.value << 8 | acc
+        pulses_low = pulses & 0xFFFF
+        pulses_high = (pulses >> 16) & 0xFFFF
+        values = [dir_acc, speed, pulses_high, pulses_low]
+        self.mb.write_registers(registeraddress=0xFD, values=values)
+        self.wait_until_motor_status(MotorStatus.STOP)
+
+    def move_absolute_by_pulses(self, acc: int, speed: int, pulses: int) -> None:
+        """ Move the motor to the specified number of pulses """
+        self.check_pulses(pulses)
+        self.check_speed(speed)
+        self.check_acceleration(acc)
+        pulses_low = pulses & 0xFFFF
+        pulses_high = (pulses >> 16) & 0xFFFF
+        values = [acc, speed, pulses_high, pulses_low]
+        self.mb.write_registers(registeraddress=0xFE, values=values)
+        self.wait_until_motor_status(MotorStatus.STOP)
+
+    def move_to_relative_axis(self, acc: int, speed: int, axis: int) -> None:
+        """ Move the motor by the specified angle """
+        self.check_acceleration(acc)
+        self.check_speed(speed)
+        axis_low = axis & 0xFFFF
+        axis_high = (axis >> 16) & 0xFFFF
+        values = [acc, speed, axis_high, axis_low]
+        self.mb.write_registers(registeraddress=0xF4, values=values)
+        self.wait_until_motor_status(MotorStatus.STOP)
+
+    def move_to_absolute_axis(self, acc: int, speed: int, axis: int) -> None:
         """ Move the motor to the specified angle """
+        self.check_acceleration(acc)
+        self.check_speed(speed)
+        axis_low = axis & 0xFFFF
+        axis_high = (axis >> 16) & 0xFFFF
+        values = [acc, speed, axis_high, axis_low]
+        self.mb.write_registers(registeraddress=0xF5, values=values)
+        self.wait_until_motor_status(MotorStatus.STOP)
 
-        packed_data = struct.pack('>HHi', acc, speed, angle)
-        inputs = list(struct.unpack('>HHHH', packed_data))
-        self.mb.write_registers(0x90, inputs)
+    def move_to_relative_angle(self, acc: int, speed: int, angle: float) -> None:
+        """ Move the motor by the specified angle """
+        axis = int(angle * ANGLE_TO_AXIS)
+        self.move_to_relative_axis(acc, speed, axis)
+
+    def move_to_absolute_angle(self, acc: int, speed: int, angle: float) -> None:
+        """ Move the motor to the specified angle """
+        axis = int(angle * ANGLE_TO_AXIS)
+        self.move_to_absolute_axis(acc, speed, axis)
+
+    def wait_until_motor_status(self, scope_status: MotorStatus) -> None:
+        """ Wait until the motor stops """
+        while 1:
+            status = self.read_motor_status()
+            logging.debug("Motor status: %s", status)
+            if status == scope_status:
+                break
+
+    def check_speed(self, speed: int) -> None:
+        """ Check the speed """
+        if speed < 0 or speed > 3000:
+            raise ValueError("Speed must be between 0 and 3000")
+
+    def check_acceleration(self, acc: int) -> None:
+        """ Check the acceleration """
+        if acc < 0 or acc > 255:
+            raise ValueError("Acceleration must be between 0 and 255")
+
+    def check_pulses(self, pulses: int) -> None:
+        """ Check the pulses """
+        if pulses < 0 or pulses > 0xFFFFFF:
+            raise ValueError("Pulses must be between 0 and 0xFFFFFF")
+
+    def read_angle_carry(self):
+        carry, value = self.read_encoder_value_carry()
+        angle = carry / ANGLE_TO_AXIS + value / ANGLE_TO_AXIS
+
+        return angle
