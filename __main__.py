@@ -2,19 +2,15 @@
 import time, sys, logging
 import minimalmodbus
 from servo import scan as scanner, servo
+from knx_plc import flap_actuator as flap_actuator
 import asyncio
 
 from xknx import XKNX
-from xknx.devices import NumericValue, RawValue, Sensor
 from xknx.io import ConnectionConfig, ConnectionType
 
-
 FLAP_ANGLE_FACTOR = 320/90
-PERCENT_TO_ANGLE_FACTOR = 90/100
-
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 
 # Example usage
 available_ports = scanner.list_serial_ports()
@@ -36,82 +32,42 @@ if len(found_devices) == 0:
 instrument = minimalmodbus.Instrument(SERVO_PORT, found_devices[0])
 instrument.serial.baudrate = 38400
 
-test_servo = servo.Servo(instrument, servo.MotorType.SERVO_42_D, 1,
-                         2000, 20, 200, 16)
-
-time.sleep(1)
-
-print(test_servo.read_motor_status())
-'''
-test_servo.write_no_limit_go_home_parameter(max_return_angle=90*FLAP_ANGLE_FACTOR, no_switch_go_home=True,
-                                            no_limit_current=1000)
-
-test_servo.go_home()
-
-test_servo.move_to_absolute_angle(speed=20, acc=1, angle=50*PERCENT_TO_ANGLE_FACTOR*FLAP_ANGLE_FACTOR)
-'''
-
-
-def flap_callback(knx_sensor: Sensor) -> None:
-    """Run callback when the light changed any of its state."""
-    try:
-        val = float(knx_sensor.sensor_value.value)
-        print(f"{knx_sensor.name} - {val} {knx_sensor.unit_of_measurement()}")
-        val = 100 - val
-        test_servo.move_to_absolute_angle(speed=20, acc=1, angle=val * PERCENT_TO_ANGLE_FACTOR * FLAP_ANGLE_FACTOR)
-    except Exception as e:
-        print(f"Error in flap_callback: {e}")
-
 
 async def main():
+    """Main function."""
     xknx = XKNX(connection_config=ConnectionConfig(connection_type=ConnectionType.AUTOMATIC))
 
     try:
         await xknx.start()
 
-        is_value = NumericValue(
+        test_flap = flap_actuator.FlapActuator(
+            name="Flap Actuator",
             xknx=xknx,
-            name='Flap Angle',
-            group_address='30/7/40',
-            value_type='percent',
-            respond_to_read=True,
+            ga_position="30/7/41",
+            ga_set_point="30/7/40",
+            mb=instrument,
+            address=1,
+            max_current=2000,
+            hold_current_percent=20,
+            no_limit_current=1000,
+            full_steps=200,
+            micro_steps=16,
+            speed=20,
+            acc=1,
         )
 
-        set_point_angle = Sensor(
-            xknx=xknx,
-            name='Flap Angle Setpoint',
-            group_address_state='30/7/41',
-            value_type='percent',
-            device_updated_cb=flap_callback,
-        )
+        update_task = asyncio.create_task(flap_actuator.update_flap_angle(test_flap.knx_position,
+                                                                          test_flap.flap_servo))
+        await update_task
 
-        xknx.devices.async_add(is_value)
-        xknx.devices.async_add(set_point_angle)
-
-        old_value = 0
-        while 1:
-            await asyncio.sleep(1)
-            angle = test_servo.read_angle_carry()
-            percent = 100.0 - int(angle / FLAP_ANGLE_FACTOR / PERCENT_TO_ANGLE_FACTOR)
-            if percent == old_value:
-                continue
-            old_value = percent
-            if percent < 0:
-                percent = 0
-            if percent > 100:
-                percent = 100
-            print(f"Current angle: {angle} Current percent: {percent}")
-            await is_value.set(percent)
+    except asyncio.CancelledError:
+        print("Program cancelled, stopping gracefully.")
 
     finally:
         await xknx.stop()
 
-
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
-
-
-
-
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Exiting...")
