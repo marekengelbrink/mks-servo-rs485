@@ -7,12 +7,12 @@ def parse_requirements(filename):
 
 setup(
     name="mks_servo_rs485",
-    version="0.1",
+    version="0.3.0",
     packages=find_packages(),
     install_requires=parse_requirements('requirements.txt'),
     author="Marek Engelbrink",
     author_email="marek.engelbrink@gmail.com",
-    description="A simple example private package",
+    description="Makerbase Servo42D RS485 communication library",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/marekengelbrink/mks-servo-rs485",
