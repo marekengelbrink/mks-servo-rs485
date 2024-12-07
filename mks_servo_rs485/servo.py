@@ -4,7 +4,6 @@ import math
 import time
 from dataclasses import dataclass
 from enum import Enum
-import struct
 import minimalmodbus
 
 ENCODER_STEPS = 16384
